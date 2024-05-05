@@ -1,0 +1,12 @@
+
+data_util/__pycache__/face3d_helper.cpython-311.pyc
+*.pyc
+deep_3drecon/BFM/01_MorphableModel.mat
+deep_3drecon/BFM/BFM_exp_idx.mat
+deep_3drecon/BFM/BFM_front_idx.mat
+deep_3drecon/BFM/BFM_model_front.mat
+deep_3drecon/BFM/Exp_Pca.bin
+deep_3drecon/BFM/facemodel_info.mat
+deep_3drecon/BFM/index_mp468_from_mesh35709.npy
+deep_3drecon/BFM/std_exp.txt
+shape_predictor_68_face_landmarks.dat

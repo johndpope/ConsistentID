@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.io import loadmat
-
+import dlib
 from deep_3drecon.deep_3drecon_models.bfm import perspective_projection
 
 
@@ -13,6 +13,9 @@ class Face3DHelper(nn.Module):
         self.keypoint_mode = keypoint_mode # lm68 | mediapipe
         self.bfm_dir = bfm_dir
         self.load_3dmm()
+        self.detector = dlib.get_frontal_face_detector()
+        self.predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
+
         if use_gpu: self.to("cuda")
             
     def load_3dmm(self):
@@ -45,6 +48,27 @@ class Face3DHelper(nn.Module):
         self.key_exp_base_np = self.key_exp_base.cpu().numpy()
 
         self.register_buffer('persc_proj', torch.tensor(perspective_projection(focal=1015, center=112))) 
+    
+
+        self.mean_shape = torch.from_numpy(model['meanshape'].T).float()
+        self.id_bases = torch.from_numpy(model['idBase']).float()
+        self.exp_bases = torch.from_numpy(model['exBase']).float()
+        # self.point_buf = model['point_buf']
+        self.landmark_index = np.squeeze(model['keypoints']).astype(np.int32) - 1
+
+
+    def detect_landmarks(self, image):
+        """Detect facial landmarks using dlib."""
+        faces = self.detector(image, 1)
+        if len(faces) > 0:
+            shape = self.predictor(image, faces[0])
+            landmarks = np.array([[p.x, p.y] for p in shape.parts()])
+            return landmarks
+        else:
+            return None  # No faces detected
+
+        
+        
     def split_coeff(self, coeff):
         """
         coeff: Tensor[B, T, c=257] or [T, c=257]
@@ -59,6 +83,93 @@ class Face3DHelper(nn.Module):
         }
         return ret_dict
     
+    def estimate_coeff(self, preprocessed_image):
+        landmarks = self.detect_landmarks(preprocessed_image)
+        # Convert landmarks to tensor
+        landmarks = torch.from_numpy(landmarks).float()
+
+        # Estimate identity coefficients
+        id_coeff = self.estimate_id_coeff(landmarks)
+
+        # Estimate expression coefficients
+        exp_coeff = self.estimate_exp_coeff(landmarks)
+
+        # Estimate euler angles
+        euler_coeff = self.estimate_euler_coeff(landmarks)
+
+        # Estimate translation coefficients
+        trans_coeff = self.estimate_trans_coeff(landmarks)
+
+        coeff_dict = {
+            "id": id_coeff,
+            "exp": exp_coeff,
+            "euler": euler_coeff,
+            "trans": trans_coeff
+        }
+
+        return coeff_dict
+
+    def estimate_id_coeff(self, landmarks):
+        num_id_bases = self.id_bases.shape[1]
+        id_coeff = torch.zeros(num_id_bases)
+
+        # Extract corresponding points from landmarks
+        landmark_points = landmarks[self.landmark_index]
+
+        # Solve for identity coefficients using least squares
+        A = self.id_bases[self.landmark_index]
+        b = landmark_points - self.mean_shape[self.landmark_index]
+        id_coeff, _ = torch.lstsq(b, A)
+
+        return id_coeff[:num_id_bases].numpy()
+
+    def estimate_exp_coeff(self, landmarks):
+        num_exp_bases = self.exp_bases.shape[1]
+        exp_coeff = torch.zeros(num_exp_bases)
+
+        # Extract corresponding points from landmarks
+        landmark_points = landmarks[self.landmark_index]
+
+        # Solve for expression coefficients using least squares
+        A = self.exp_bases[self.landmark_index]
+        b = landmark_points - self.mean_shape[self.landmark_index]
+        exp_coeff, _ = torch.lstsq(b, A)
+
+        return exp_coeff[:num_exp_bases].numpy()
+
+    def estimate_euler_coeff(self, landmarks):
+        # Implement euler angle estimation based on facial landmarks
+        # Example:
+        # Assuming landmarks are in the format: [x1, y1, x2, y2, ..., xn, yn]
+        left_eye = landmarks[36:42]
+        right_eye = landmarks[42:48]
+        nose = landmarks[27:36]
+
+        # Calculate eye centers
+        left_eye_center = np.mean(left_eye, axis=0)
+        right_eye_center = np.mean(right_eye, axis=0)
+
+        # Calculate the direction vector between eye centers
+        eye_direction = right_eye_center - left_eye_center
+
+        # Calculate the angle between the eye direction and the horizontal axis
+        eye_angle = np.arctan2(eye_direction[1], eye_direction[0])
+
+        # Assuming pitch and yaw are small, set them to 0
+        pitch = 0
+        yaw = 0
+
+        euler_coeff = np.array([pitch, yaw, eye_angle])
+        return euler_coeff
+
+    def estimate_trans_coeff(self, landmarks):
+        # Implement translation coefficient estimation based on facial landmarks
+        # Example:
+        # Assuming landmarks are in the format: [x1, y1, x2, y2, ..., xn, yn]
+        nose_tip = landmarks[30]
+        trans_coeff = np.array([nose_tip[0], nose_tip[1], 0])
+        return trans_coeff
+
     def reconstruct_face_mesh(self, id_coeff, exp_coeff):
         """
         Generate a pose-independent 3D face mesh!
