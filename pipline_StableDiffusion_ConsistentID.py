@@ -65,6 +65,8 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         # FaceID
         self.app = FaceAnalysis(name="buffalo_l", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
+        self.similarity_threshold = 0.7  # Adjust this threshold as needed
+
 
 
         self.face3d_helper = Face3DHelper(bfm_dir='deep_3drecon/BFM', keypoint_mode='mediapipe', use_gpu=True)
@@ -179,6 +181,50 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         
         unet.set_attn_processor(attn_procs)
 
+
+
+    @torch.inference_mode()
+    def detect_faces(self, input_image):
+        faces = self.app.get(np.array(input_image))
+        return faces
+
+    @torch.inference_mode()
+    def detect_facial_landmarks(self, input_image):
+        faces = self.detect_faces(input_image)
+        if len(faces) > 0:
+            landmarks = faces[0].landmark_2d_106
+            return landmarks
+        else:
+            return None
+
+    @torch.inference_mode()
+    def align_face(self, input_image):
+        landmarks = self.detect_facial_landmarks(input_image)
+        if landmarks is not None:
+            # Perform face alignment using the detected landmarks
+            aligned_face = self.app.align(np.array(input_image), landmarks)
+            return aligned_face
+        else:
+            return input_image
+
+    @torch.inference_mode()
+    def extract_facial_features(self, input_image):
+        faces = self.detect_faces(input_image)
+        if len(faces) > 0:
+            features = faces[0].normed_embedding
+            return features
+        else:
+            return None
+
+    @torch.inference_mode()
+    def verify_face(self, input_image, generated_image):
+        input_features = self.extract_facial_features(input_image)
+        generated_features = self.extract_facial_features(generated_image)
+        if input_features is not None and generated_features is not None:
+            similarity = np.dot(input_features, generated_features)
+            return similarity > self.similarity_threshold
+        else:
+            return False
     @torch.inference_mode()
     def get_facial_embeds(self, prompt_embeds, negative_prompt_embeds, facial_clip_images, facial_token_masks, valid_facial_token_idx_mask, lm3d):
         
@@ -298,7 +344,9 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
     @torch.inference_mode()
     def get_prepare_facemask(self, input_image_file):
 
-        vis_parsing_anno_color, vis_parsing_anno = self.parsing_face_mask(input_image_file)
+        aligned_face = self.align_face(input_image_file)
+        vis_parsing_anno_color, vis_parsing_anno = self.parsing_face_mask(aligned_face)
+   
         parsing_mask_list = masks_for_unique_values(vis_parsing_anno) 
 
         key_parsing_mask_list = {}
@@ -631,6 +679,11 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
+
+        # 9.4 Verify the generated face
+        generated_image = self.decode_latents(latents)
+        if not self.verify_face(input_image_file, generated_image):
+            print("Warning: Generated face does not match the input identity.")
 
         if not return_dict:
             return (image, has_nsfw_concept)
