@@ -16,6 +16,9 @@ from diffusers.utils import _get_model_file
 from functions import process_text_with_markers, masks_for_unique_values, fetch_mask_raw_image, tokenize_and_mask_noun_phrases_ends, prepare_image_token_idx
 from functions import ProjPlusModel, masks_for_unique_values
 from attention import Consistent_IPAttProcessor, Consistent_AttProcessor, FacialEncoder
+from data_util.face3d_helper import Face3DHelper
+
+
 
 ### Model can be imported from https://github.com/zllrunning/face-parsing.PyTorch?tab=readme-ov-file
 ### We use the ckpt of 79999_iter.pth: https://drive.google.com/open?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812
@@ -46,6 +49,7 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         lora_rank= 128,
         **kwargs,
     ):
+        
         self.lora_rank = lora_rank 
         self.torch_dtype = torch_dtype
         self.num_tokens = num_tokens
@@ -61,6 +65,10 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         # FaceID
         self.app = FaceAnalysis(name="buffalo_l", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
+
+
+        self.face3d_helper = Face3DHelper(bfm_dir='deep_3drecon/BFM', keypoint_mode='mediapipe', use_gpu=True)
+
 
         ### BiSeNet
         self.bise_net = BiSeNet(n_classes = 19)
@@ -172,7 +180,7 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         unet.set_attn_processor(attn_procs)
 
     @torch.inference_mode()
-    def get_facial_embeds(self, prompt_embeds, negative_prompt_embeds, facial_clip_images, facial_token_masks, valid_facial_token_idx_mask):
+    def get_facial_embeds(self, prompt_embeds, negative_prompt_embeds, facial_clip_images, facial_token_masks, valid_facial_token_idx_mask, lm3d):
         
         hidden_states = []
         uncond_hidden_states = []
@@ -183,6 +191,11 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
             uncond_hidden_states.append(uncond_hidden_state)
         multi_facial_embeds = torch.stack(hidden_states)       
         uncond_multi_facial_embeds = torch.stack(uncond_hidden_states)   
+
+        # Incorporate 3D facial landmarks
+        lm3d_embeds = self.image_encoder(lm3d.to(self.device, dtype=self.torch_dtype), output_hidden_states=True).hidden_states[-2]
+        multi_facial_embeds = torch.cat([multi_facial_embeds, lm3d_embeds.unsqueeze(0)], dim=1)
+        uncond_multi_facial_embeds = torch.cat([uncond_multi_facial_embeds, lm3d_embeds.unsqueeze(0)], dim=1)
 
         # condition 
         facial_prompt_embeds = self.FacialEncoder(prompt_embeds, multi_facial_embeds, facial_token_masks, valid_facial_token_idx_mask)  
@@ -303,7 +316,17 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
             
                 key_parsing_mask_list[key] = mask_image            
 
-        return key_parsing_mask_list, vis_parsing_anno_color
+        # Extract 3D facial landmarks
+        coeff_dict = self.face3d_helper.estimate_coeff(input_image_file)
+        lm3d = self.face3d_helper.reconstruct_lm3d(
+            torch.tensor(coeff_dict['id']).cuda(),
+            torch.tensor(coeff_dict['exp']).cuda(),
+            torch.tensor(coeff_dict['euler']).cuda(),
+            torch.tensor(coeff_dict['trans']).cuda()
+        )
+        return key_parsing_mask_list, vis_parsing_anno_color, lm3d
+
+
 
     def encode_prompt_with_trigger_word(
         self,
@@ -433,7 +456,11 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
 
         faceid_embeds = self.get_prepare_faceid(face_image=input_image_file)
         face_caption = self.get_prepare_llva_caption(input_image_file)
-        key_parsing_mask_list, vis_parsing_anno_color = self.get_prepare_facemask(input_image_file)
+        key_parsing_mask_list, vis_parsing_anno_color, lm3d = self.get_prepare_facemask(input_image_file)
+   
+        # faceid_embeds = self.get_prepare_faceid(face_image=input_image_file)
+        # face_caption = self.get_prepare_llva_caption(input_image_file)
+        # key_parsing_mask_list, vis_parsing_anno_color = self.get_prepare_facemask(input_image_file)
 
         assert do_classifier_free_guidance
 
@@ -463,6 +490,7 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         # 4. Encode input prompt without the trigger word for delayed conditioning
         encoder_hidden_states = self.text_encoder(clean_input_id.to(device))[0] 
 
+       
         prompt_embeds = self._encode_prompt(
             prompt_text_only,
             device=device,
@@ -485,8 +513,10 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         cross_attention_kwargs = {}
 
         # 6. Get the update text embedding
-        prompt_embeds_facial, uncond_prompt_embeds_facial = self.get_facial_embeds(encoder_hidden_states, negative_encoder_hidden_states, \
-                                                            facial_clip_images, facial_token_mask, facial_token_idx_mask)
+        # prompt_embeds_facial, uncond_prompt_embeds_facial = self.get_facial_embeds(encoder_hidden_states, negative_encoder_hidden_states, \
+                                                            # facial_clip_images, facial_token_mask, facial_token_idx_mask)
+        prompt_embeds_facial, uncond_prompt_embeds_facial = self.get_facial_embeds(encoder_hidden_states, negative_encoder_hidden_states, facial_clip_images, facial_token_mask, facial_token_idx_mask, lm3d)
+
 
         prompt_embeds = torch.cat([prompt_embeds_facial, prompt_tokens_faceid], dim=1)
         negative_prompt_embeds = torch.cat([uncond_prompt_embeds_facial, uncond_prompt_tokens_faceid], dim=1)
