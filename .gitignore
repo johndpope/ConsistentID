@@ -10,3 +10,4 @@ deep_3drecon/BFM/facemodel_info.mat
 deep_3drecon/BFM/index_mp468_from_mesh35709.npy
 deep_3drecon/BFM/std_exp.txt
 shape_predictor_68_face_landmarks.dat
+ConsistentID_model_facemask_pretrain_50w.bin
