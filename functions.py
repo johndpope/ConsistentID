@@ -488,7 +488,7 @@ class FacePerceiverResampler(torch.nn.Module):
         return self.norm_out(latents)
   
 class ProjPlusModel(torch.nn.Module):
-    def __init__(self, cross_attention_dim=768, id_embeddings_dim=512, clip_embeddings_dim=1280, num_tokens=4):
+    def __init__(self, cross_attention_dim=768, id_embeddings_dim=512, clip_embeddings_dim=1280, num_tokens=4, landmarks_dim=468):
         super().__init__()
         
         self.cross_attention_dim = cross_attention_dim
@@ -510,12 +510,21 @@ class ProjPlusModel(torch.nn.Module):
             output_dim=cross_attention_dim,
             ff_mult=4,
         )
+        self.landmarks_proj = nn.Sequential(
+            nn.Linear(landmarks_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, cross_attention_dim)
+        )
         
-    def forward(self, id_embeds, clip_embeds, shortcut=False, scale=1.0):
-
+    def forward(self, id_embeds, clip_embeds, landmarks_3d=None, shortcut=False, scale=1.0):
         x = self.proj(id_embeds)
         x = x.reshape(-1, self.num_tokens, self.cross_attention_dim)
-        x = self.norm(x) 
+        x = self.norm(x)
+        
+        if landmarks_3d is not None:
+            landmarks_embeds = self.landmarks_proj(landmarks_3d)
+            x = x + landmarks_embeds.unsqueeze(1)
+        
         out = self.perceiver_resampler(x, clip_embeds)
         if shortcut:
             out = x + scale * out

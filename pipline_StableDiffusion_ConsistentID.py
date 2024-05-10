@@ -16,368 +16,13 @@ from diffusers.utils import _get_model_file
 from functions import process_text_with_markers, masks_for_unique_values, fetch_mask_raw_image, tokenize_and_mask_noun_phrases_ends, prepare_image_token_idx
 from functions import ProjPlusModel, masks_for_unique_values
 from attention import Consistent_IPAttProcessor, Consistent_AttProcessor, FacialEncoder
-from data_util.face3d_helper import Face3DHelper
+import mediapipe as mp
+
+
 ### Model can be imported from https://github.com/zllrunning/face-parsing.PyTorch?tab=readme-ov-file
 ### We use the ckpt of 79999_iter.pth: https://drive.google.com/open?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812
 ### Thanks for the open source of face-parsing model.
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.utils.model_zoo as modelzoo
-
-# from modules.bn import InPlaceABNSync as BatchNorm2d
-
-resnet18_url = 'https://download.pytorch.org/models/resnet18-5c106cde.pth'
-
-
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=False)
-
-
-class BasicBlock(nn.Module):
-    def __init__(self, in_chan, out_chan, stride=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(in_chan, out_chan, stride)
-        self.bn1 = nn.BatchNorm2d(out_chan)
-        self.conv2 = conv3x3(out_chan, out_chan)
-        self.bn2 = nn.BatchNorm2d(out_chan)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = None
-        if in_chan != out_chan or stride != 1:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(in_chan, out_chan,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_chan),
-                )
-
-    def forward(self, x):
-        residual = self.conv1(x)
-        residual = F.relu(self.bn1(residual))
-        residual = self.conv2(residual)
-        residual = self.bn2(residual)
-
-        shortcut = x
-        if self.downsample is not None:
-            shortcut = self.downsample(x)
-
-        out = shortcut + residual
-        out = self.relu(out)
-        return out
-
-
-def create_layer_basic(in_chan, out_chan, bnum, stride=1):
-    layers = [BasicBlock(in_chan, out_chan, stride=stride)]
-    for i in range(bnum-1):
-        layers.append(BasicBlock(out_chan, out_chan, stride=1))
-    return nn.Sequential(*layers)
-
-
-class Resnet18(nn.Module):
-    def __init__(self):
-        super(Resnet18, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = create_layer_basic(64, 64, bnum=2, stride=1)
-        self.layer2 = create_layer_basic(64, 128, bnum=2, stride=2)
-        self.layer3 = create_layer_basic(128, 256, bnum=2, stride=2)
-        self.layer4 = create_layer_basic(256, 512, bnum=2, stride=2)
-        self.init_weight()
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(self.bn1(x))
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        feat8 = self.layer2(x) # 1/8
-        feat16 = self.layer3(feat8) # 1/16
-        feat32 = self.layer4(feat16) # 1/32
-        return feat8, feat16, feat32
-
-    def init_weight(self):
-        state_dict = modelzoo.load_url(resnet18_url)
-        self_state_dict = self.state_dict()
-        for k, v in state_dict.items():
-            if 'fc' in k: continue
-            self_state_dict.update({k: v})
-        self.load_state_dict(self_state_dict)
-
-    def get_params(self):
-        wd_params, nowd_params = [], []
-        for name, module in self.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                wd_params.append(module.weight)
-                if not module.bias is None:
-                    nowd_params.append(module.bias)
-            elif isinstance(module,  nn.BatchNorm2d):
-                nowd_params += list(module.parameters())
-        return wd_params, nowd_params
-
-class ConvBNReLU(nn.Module):
-    def __init__(self, in_chan, out_chan, ks=3, stride=1, padding=1, *args, **kwargs):
-        super(ConvBNReLU, self).__init__()
-        self.conv = nn.Conv2d(in_chan,
-                out_chan,
-                kernel_size = ks,
-                stride = stride,
-                padding = padding,
-                bias = False)
-        self.bn = nn.BatchNorm2d(out_chan)
-        self.init_weight()
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = F.relu(self.bn(x))
-        return x
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-class BiSeNetOutput(nn.Module):
-    def __init__(self, in_chan, mid_chan, n_classes, *args, **kwargs):
-        super(BiSeNetOutput, self).__init__()
-        self.conv = ConvBNReLU(in_chan, mid_chan, ks=3, stride=1, padding=1)
-        self.conv_out = nn.Conv2d(mid_chan, n_classes, kernel_size=1, bias=False)
-        self.init_weight()
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.conv_out(x)
-        return x
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-    def get_params(self):
-        wd_params, nowd_params = [], []
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-                wd_params.append(module.weight)
-                if not module.bias is None:
-                    nowd_params.append(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                nowd_params += list(module.parameters())
-        return wd_params, nowd_params
-
-
-class AttentionRefinementModule(nn.Module):
-    def __init__(self, in_chan, out_chan, *args, **kwargs):
-        super(AttentionRefinementModule, self).__init__()
-        self.conv = ConvBNReLU(in_chan, out_chan, ks=3, stride=1, padding=1)
-        self.conv_atten = nn.Conv2d(out_chan, out_chan, kernel_size= 1, bias=False)
-        self.bn_atten = nn.BatchNorm2d(out_chan)
-        self.sigmoid_atten = nn.Sigmoid()
-        self.init_weight()
-
-    def forward(self, x):
-        feat = self.conv(x)
-        atten = F.avg_pool2d(feat, feat.size()[2:])
-        atten = self.conv_atten(atten)
-        atten = self.bn_atten(atten)
-        atten = self.sigmoid_atten(atten)
-        out = torch.mul(feat, atten)
-        return out
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-
-class ContextPath(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(ContextPath, self).__init__()
-        self.resnet = Resnet18()
-        self.arm16 = AttentionRefinementModule(256, 128)
-        self.arm32 = AttentionRefinementModule(512, 128)
-        self.conv_head32 = ConvBNReLU(128, 128, ks=3, stride=1, padding=1)
-        self.conv_head16 = ConvBNReLU(128, 128, ks=3, stride=1, padding=1)
-        self.conv_avg = ConvBNReLU(512, 128, ks=1, stride=1, padding=0)
-
-        self.init_weight()
-
-    def forward(self, x):
-        H0, W0 = x.size()[2:]
-        feat8, feat16, feat32 = self.resnet(x)
-        H8, W8 = feat8.size()[2:]
-        H16, W16 = feat16.size()[2:]
-        H32, W32 = feat32.size()[2:]
-
-        avg = F.avg_pool2d(feat32, feat32.size()[2:])
-        avg = self.conv_avg(avg)
-        avg_up = F.interpolate(avg, (H32, W32), mode='nearest')
-
-        feat32_arm = self.arm32(feat32)
-        feat32_sum = feat32_arm + avg_up
-        feat32_up = F.interpolate(feat32_sum, (H16, W16), mode='nearest')
-        feat32_up = self.conv_head32(feat32_up)
-
-        feat16_arm = self.arm16(feat16)
-        feat16_sum = feat16_arm + feat32_up
-        feat16_up = F.interpolate(feat16_sum, (H8, W8), mode='nearest')
-        feat16_up = self.conv_head16(feat16_up)
-
-        return feat8, feat16_up, feat32_up  # x8, x8, x16
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-    def get_params(self):
-        wd_params, nowd_params = [], []
-        for name, module in self.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                wd_params.append(module.weight)
-                if not module.bias is None:
-                    nowd_params.append(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                nowd_params += list(module.parameters())
-        return wd_params, nowd_params
-
-
-### This is not used, since I replace this with the resnet feature with the same size
-class SpatialPath(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(SpatialPath, self).__init__()
-        self.conv1 = ConvBNReLU(3, 64, ks=7, stride=2, padding=3)
-        self.conv2 = ConvBNReLU(64, 64, ks=3, stride=2, padding=1)
-        self.conv3 = ConvBNReLU(64, 64, ks=3, stride=2, padding=1)
-        self.conv_out = ConvBNReLU(64, 128, ks=1, stride=1, padding=0)
-        self.init_weight()
-
-    def forward(self, x):
-        feat = self.conv1(x)
-        feat = self.conv2(feat)
-        feat = self.conv3(feat)
-        feat = self.conv_out(feat)
-        return feat
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-    def get_params(self):
-        wd_params, nowd_params = [], []
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-                wd_params.append(module.weight)
-                if not module.bias is None:
-                    nowd_params.append(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                nowd_params += list(module.parameters())
-        return wd_params, nowd_params
-
-
-class FeatureFusionModule(nn.Module):
-    def __init__(self, in_chan, out_chan, *args, **kwargs):
-        super(FeatureFusionModule, self).__init__()
-        self.convblk = ConvBNReLU(in_chan, out_chan, ks=1, stride=1, padding=0)
-        self.conv1 = nn.Conv2d(out_chan,
-                out_chan//4,
-                kernel_size = 1,
-                stride = 1,
-                padding = 0,
-                bias = False)
-        self.conv2 = nn.Conv2d(out_chan//4,
-                out_chan,
-                kernel_size = 1,
-                stride = 1,
-                padding = 0,
-                bias = False)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-        self.init_weight()
-
-    def forward(self, fsp, fcp):
-        fcat = torch.cat([fsp, fcp], dim=1)
-        feat = self.convblk(fcat)
-        atten = F.avg_pool2d(feat, feat.size()[2:])
-        atten = self.conv1(atten)
-        atten = self.relu(atten)
-        atten = self.conv2(atten)
-        atten = self.sigmoid(atten)
-        feat_atten = torch.mul(feat, atten)
-        feat_out = feat_atten + feat
-        return feat_out
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-    def get_params(self):
-        wd_params, nowd_params = [], []
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-                wd_params.append(module.weight)
-                if not module.bias is None:
-                    nowd_params.append(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                nowd_params += list(module.parameters())
-        return wd_params, nowd_params
-
-
-class BiSeNet(nn.Module):
-    def __init__(self, n_classes, *args, **kwargs):
-        super(BiSeNet, self).__init__()
-        self.cp = ContextPath()
-        ## here self.sp is deleted
-        self.ffm = FeatureFusionModule(256, 256)
-        self.conv_out = BiSeNetOutput(256, 256, n_classes)
-        self.conv_out16 = BiSeNetOutput(128, 64, n_classes)
-        self.conv_out32 = BiSeNetOutput(128, 64, n_classes)
-        self.init_weight()
-
-    def forward(self, x):
-        H, W = x.size()[2:]
-        feat_res8, feat_cp8, feat_cp16 = self.cp(x)  # here return res3b1 feature
-        feat_sp = feat_res8  # use res3b1 feature to replace spatial path feature
-        feat_fuse = self.ffm(feat_sp, feat_cp8)
-
-        feat_out = self.conv_out(feat_fuse)
-        feat_out16 = self.conv_out16(feat_cp8)
-        feat_out32 = self.conv_out32(feat_cp16)
-
-        feat_out = F.interpolate(feat_out, (H, W), mode='bilinear', align_corners=True)
-        feat_out16 = F.interpolate(feat_out16, (H, W), mode='bilinear', align_corners=True)
-        feat_out32 = F.interpolate(feat_out32, (H, W), mode='bilinear', align_corners=True)
-        return feat_out, feat_out16, feat_out32
-
-    def init_weight(self):
-        for ly in self.children():
-            if isinstance(ly, nn.Conv2d):
-                nn.init.kaiming_normal_(ly.weight, a=1)
-                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
-
-    def get_params(self):
-        wd_params, nowd_params, lr_mul_wd_params, lr_mul_nowd_params = [], [], [], []
-        for name, child in self.named_children():
-            child_wd_params, child_nowd_params = child.get_params()
-            if isinstance(child, FeatureFusionModule) or isinstance(child, BiSeNetOutput):
-                lr_mul_wd_params += child_wd_params
-                lr_mul_nowd_params += child_nowd_params
-            else:
-                wd_params += child_wd_params
-                nowd_params += child_nowd_params
-        return wd_params, nowd_params, lr_mul_wd_params, lr_mul_nowd_params
-
+from models.BiSeNet.model import BiSeNet
 
 PipelineImageInput = Union[
     PIL.Image.Image,
@@ -386,7 +31,7 @@ PipelineImageInput = Union[
     List[torch.FloatTensor],
 ]
 
-
+### Download the pretrained model from huggingface and put it locally, then place the model in a local directory and specify the directory location.
 class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
     
     @validate_hf_hub_args
@@ -397,7 +42,7 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         subfolder: str = '',
         trigger_word_ID: str = '<|image|>',
         trigger_word_facial: str = '<|facial|>',
-        image_encoder_path: str = 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',   # TODO Import CLIP pretrained model
+        image_encoder_path: str = 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',  
         torch_dtype = torch.float16,
         num_tokens = 4,
         lora_rank= 128,
@@ -418,17 +63,11 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         # FaceID
         self.app = FaceAnalysis(name="buffalo_l", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
-        self.similarity_threshold = 0.7  # Adjust this threshold as needed
-
-
-
-        self.face3d_helper = Face3DHelper(bfm_dir='deep_3drecon/BFM', keypoint_mode='mediapipe', use_gpu=True)
-
 
         ### BiSeNet
         self.bise_net = BiSeNet(n_classes = 19)
         self.bise_net.cuda()
-        self.bise_net_cp='./models/BiSeNet_pretrained_for_ConsistentID.pth' # Import BiSeNet model
+        self.bise_net_cp='JackAILab/ConsistentID/face_parsing.pth' 
         self.bise_net.load_state_dict(torch.load(self.bise_net_cp))
         self.bise_net.eval()
         # Colors for all 20 parts
@@ -442,8 +81,9 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
                     [255, 0, 255], [255, 85, 255], [255, 170, 255],
                     [0, 255, 255], [85, 255, 255], [170, 255, 255]]
         
-        ### LLVA Optional
-        self.llva_model_path = "" #TODO import llava weights
+        ### LLVA (Optional)
+        self.llva_model_path = "liuhaotian/llava-v1.5-13b" # TODO 
+        # IMPORTANT! Download the openai/clip-vit-large-patch14-336 model and specify the model path in config.json ("mm_vision_tower": "openai/clip-vit-large-patch14-336").
         self.llva_prompt = "Describe this person's facial features for me, including face, ears, eyes, nose, and mouth." 
         self.llva_tokenizer, self.llva_model, self.llva_image_processor, self.llva_context_len = None,None,None,None #load_pretrained_model(self.llva_model_path)
 
@@ -451,10 +91,17 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
             cross_attention_dim=self.unet.config.cross_attention_dim, 
             id_embeddings_dim=512,
             clip_embeddings_dim=self.image_encoder.config.hidden_size, 
-            num_tokens=self.num_tokens,  # 4
+            num_tokens=self.num_tokens,  # 4 - inspirsed by IPAdapter and Midjourney
         ).to(self.device, dtype=self.torch_dtype)
         self.FacialEncoder = FacialEncoder(self.image_encoder).to(self.device, dtype=self.torch_dtype)
 
+
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5)
         # Load the main state dict first.
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
@@ -534,84 +181,20 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         
         unet.set_attn_processor(attn_procs)
 
-
-
-    import cv2
-    import numpy as np
-
     @torch.inference_mode()
-    def align_the_face(self, input_image, landmarks):
-        # Define the target coordinates for the aligned face
-        target_coords = np.array([
-            [0.31556875, 0.4615741],  # Left eye
-            [0.68262291, 0.4615741],  # Right eye
-            [0.5, 0.6405965],         # Nose tip
-            [0.34947187, 0.8246138],  # Left mouth corner
-            [0.65073854, 0.8246138]   # Right mouth corner
-        ], dtype=np.float32)
-
-        # Convert landmarks to numpy array
-        landmarks = np.array(landmarks, dtype=np.float32)
-
-        # Select the relevant landmarks for alignment
-        selected_landmarks = landmarks[[38, 88, 80, 84, 90]]
-
-        # Compute the transformation matrix
-        transformation_matrix, _ = cv2.estimateAffinePartial2D(selected_landmarks, target_coords, method=cv2.LMEDS)
-
-        # Get the image dimensions
-        height, width, _ = input_image.shape
-
-        # Apply the transformation to the input image
-        aligned_face = cv2.warpAffine(input_image, transformation_matrix, (width, height), borderValue=0.0)
-
-        return aligned_face
-
-
-    @torch.inference_mode()
-    def detect_faces(self, input_image):
-        faces = self.app.get(np.array(input_image))
-        return faces
-
-    @torch.inference_mode()
-    def detect_facial_landmarks(self, input_image):
-        faces = self.detect_faces(input_image)
-        if len(faces) > 0:
-            landmarks = faces[0].landmark_2d_106
-            return landmarks
-        else:
+    def get_3d_facial_landmarks(self,image):
+        results = self.face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        if not results.multi_face_landmarks:
             return None
+        
+        landmarks_3d = []
+        for landmark in results.multi_face_landmarks[0].landmark:
+            landmarks_3d.append([landmark.x, landmark.y, landmark.z])
+        
+        return np.array(landmarks_3d)
 
     @torch.inference_mode()
-    def align_face(self, input_image):
-        landmarks = self.detect_facial_landmarks(input_image)
-        if landmarks is not None:
-            # Perform face alignment using the detected landmarks
-            aligned_face = self.align_the_face(np.array(input_image), landmarks)
-            return aligned_face
-        else:
-            return input_image
-
-    @torch.inference_mode()
-    def extract_facial_features(self, input_image):
-        faces = self.detect_faces(input_image)
-        if len(faces) > 0:
-            features = faces[0].normed_embedding
-            return features
-        else:
-            return None
-
-    @torch.inference_mode()
-    def verify_face(self, input_image, generated_image):
-        input_features = self.extract_facial_features(input_image)
-        generated_features = self.extract_facial_features(generated_image)
-        if input_features is not None and generated_features is not None:
-            similarity = np.dot(input_features, generated_features)
-            return similarity > self.similarity_threshold
-        else:
-            return False
-    @torch.inference_mode()
-    def get_facial_embeds(self, prompt_embeds, negative_prompt_embeds, facial_clip_images, facial_token_masks, valid_facial_token_idx_mask, lm3d):
+    def get_facial_embeds(self, prompt_embeds, negative_prompt_embeds, facial_clip_images, facial_token_masks, valid_facial_token_idx_mask):
         
         hidden_states = []
         uncond_hidden_states = []
@@ -622,11 +205,6 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
             uncond_hidden_states.append(uncond_hidden_state)
         multi_facial_embeds = torch.stack(hidden_states)       
         uncond_multi_facial_embeds = torch.stack(uncond_hidden_states)   
-
-        # Incorporate 3D facial landmarks
-        lm3d_embeds = self.image_encoder(lm3d.to(self.device, dtype=self.torch_dtype), output_hidden_states=True).hidden_states[-2]
-        multi_facial_embeds = torch.cat([multi_facial_embeds, lm3d_embeds.unsqueeze(0)], dim=1)
-        uncond_multi_facial_embeds = torch.cat([uncond_multi_facial_embeds, lm3d_embeds.unsqueeze(0)], dim=1)
 
         # condition 
         facial_prompt_embeds = self.FacialEncoder(prompt_embeds, multi_facial_embeds, facial_token_masks, valid_facial_token_idx_mask)  
@@ -659,12 +237,20 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
     def get_prepare_faceid(self, face_image):
         faceid_image = np.array(face_image)
         faces = self.app.get(faceid_image)
-        if faces==[]:
+        
+        # Extract 3D facial landmarks
+        landmarks_3d = self.get_3d_facial_landmarks(faceid_image)
+        
+        if faces == []:
             faceid_embeds = torch.zeros_like(torch.empty((1, 512)))
         else:
             faceid_embeds = torch.from_numpy(faces[0].normed_embedding).unsqueeze(0)
-
-        return faceid_embeds
+        
+        # Convert 3D landmarks to tensor
+        if landmarks_3d is not None:
+            landmarks_3d = torch.from_numpy(landmarks_3d).float()
+        
+        return faceid_embeds, landmarks_3d
 
     @torch.inference_mode()
     def parsing_face_mask(self, raw_image_refer):
@@ -676,35 +262,31 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         to_pil = transforms.ToPILImage()
 
         with torch.no_grad():
-            # Ensure raw_image_refer is a PIL Image
-            if isinstance(raw_image_refer, np.ndarray):
-                image = Image.fromarray(raw_image_refer)
-            else:
-                image = raw_image_refer
-
-            # Resize the image correctly
-            image = image.resize((512, 512), resample=Image.BILINEAR) # Note: Image.BILINEAR not resample=Image.BILINEAR
+            image = raw_image_refer.resize((512, 512), Image.BILINEAR)
+            image_resize_PIL = image
             img = to_tensor(image)
-            img = torch.unsqueeze(img, 0).float().cuda()
+            img = torch.unsqueeze(img, 0)
+            img = img.float().cuda()
             out = self.bise_net(img)[0]
             parsing_anno = out.squeeze(0).cpu().numpy().argmax(0)
-
-        im = np.array(image)
+        
+        im = np.array(image_resize_PIL)
         vis_im = im.copy().astype(np.uint8)
-        stride = 1
-        vis_parsing_anno = cv2.resize(parsing_anno, None, fx=stride, fy=stride, interpolation=cv2.INTER_NEAREST)
+        stride=1
+        vis_parsing_anno = parsing_anno.copy().astype(np.uint8)
+        vis_parsing_anno = cv2.resize(vis_parsing_anno, None, fx=stride, fy=stride, interpolation=cv2.INTER_NEAREST)
         vis_parsing_anno_color = np.zeros((vis_parsing_anno.shape[0], vis_parsing_anno.shape[1], 3)) + 255
 
         num_of_class = np.max(vis_parsing_anno)
-        for pi in range(1, num_of_class + 1):
-            index = np.where(vis_parsing_anno == pi)
-            vis_parsing_anno_color[index[0], index[1], :] = self.part_colors[pi]
+
+        for pi in range(1, num_of_class + 1): # num_of_class=17 pi=1~16
+            index = np.where(vis_parsing_anno == pi) 
+            vis_parsing_anno_color[index[0], index[1], :] = self.part_colors[pi] 
 
         vis_parsing_anno_color = vis_parsing_anno_color.astype(np.uint8)
         vis_parsing_anno_color = cv2.addWeighted(cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR), 0.4, vis_parsing_anno_color, 0.6, 0)
 
         return vis_parsing_anno_color, vis_parsing_anno
-
 
     @torch.inference_mode()
     def get_prepare_llva_caption(self, input_image_file, model_path=None, prompt=None):
@@ -733,9 +315,7 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
     @torch.inference_mode()
     def get_prepare_facemask(self, input_image_file):
 
-        aligned_face = self.align_face(input_image_file)
-        vis_parsing_anno_color, vis_parsing_anno = self.parsing_face_mask(aligned_face)
-   
+        vis_parsing_anno_color, vis_parsing_anno = self.parsing_face_mask(input_image_file)
         parsing_mask_list = masks_for_unique_values(vis_parsing_anno) 
 
         key_parsing_mask_list = {}
@@ -753,17 +333,7 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
             
                 key_parsing_mask_list[key] = mask_image            
 
-        # Extract 3D facial landmarks
-        coeff_dict = self.face3d_helper.estimate_coeff(input_image_file)
-        lm3d = self.face3d_helper.reconstruct_lm3d(
-            torch.tensor(coeff_dict['id']).cuda(),
-            torch.tensor(coeff_dict['exp']).cuda(),
-            torch.tensor(coeff_dict['euler']).cuda(),
-            torch.tensor(coeff_dict['trans']).cuda()
-        )
-        return key_parsing_mask_list, vis_parsing_anno_color, lm3d
-
-
+        return key_parsing_mask_list, vis_parsing_anno_color
 
     def encode_prompt_with_trigger_word(
         self,
@@ -891,13 +461,11 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         do_classifier_free_guidance = guidance_scale >= 1.0
         input_image_file = input_id_images[0]
 
-        faceid_embeds = self.get_prepare_faceid(face_image=input_image_file)
+        faceid_embeds, landmarks_3d = self.get_prepare_faceid(face_image=input_image_file)
+        prompt_tokens_faceid, uncond_prompt_tokens_faceid = self.get_image_embeds(faceid_embeds, face_image=input_image_file, s_scale=1.0, shortcut=False, landmarks_3d=landmarks_3d)
+
         face_caption = self.get_prepare_llva_caption(input_image_file)
-        key_parsing_mask_list, vis_parsing_anno_color, lm3d = self.get_prepare_facemask(input_image_file)
-   
-        # faceid_embeds = self.get_prepare_faceid(face_image=input_image_file)
-        # face_caption = self.get_prepare_llva_caption(input_image_file)
-        # key_parsing_mask_list, vis_parsing_anno_color = self.get_prepare_facemask(input_image_file)
+        key_parsing_mask_list, vis_parsing_anno_color = self.get_prepare_facemask(input_image_file)
 
         assert do_classifier_free_guidance
 
@@ -927,7 +495,6 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         # 4. Encode input prompt without the trigger word for delayed conditioning
         encoder_hidden_states = self.text_encoder(clean_input_id.to(device))[0] 
 
-       
         prompt_embeds = self._encode_prompt(
             prompt_text_only,
             device=device,
@@ -950,10 +517,8 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         cross_attention_kwargs = {}
 
         # 6. Get the update text embedding
-        # prompt_embeds_facial, uncond_prompt_embeds_facial = self.get_facial_embeds(encoder_hidden_states, negative_encoder_hidden_states, \
-                                                            # facial_clip_images, facial_token_mask, facial_token_idx_mask)
-        prompt_embeds_facial, uncond_prompt_embeds_facial = self.get_facial_embeds(encoder_hidden_states, negative_encoder_hidden_states, facial_clip_images, facial_token_mask, facial_token_idx_mask, lm3d)
-
+        prompt_embeds_facial, uncond_prompt_embeds_facial = self.get_facial_embeds(encoder_hidden_states, negative_encoder_hidden_states, \
+                                                            facial_clip_images, facial_token_mask, facial_token_idx_mask)
 
         prompt_embeds = torch.cat([prompt_embeds_facial, prompt_tokens_faceid], dim=1)
         negative_prompt_embeds = torch.cat([uncond_prompt_embeds_facial, uncond_prompt_tokens_faceid], dim=1)
@@ -1069,18 +634,12 @@ class ConsistentIDStableDiffusionPipeline(StableDiffusionPipeline):
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
 
-        # 9.4 Verify the generated face
-        generated_image = self.decode_latents(latents)
-        if not self.verify_face(input_image_file, generated_image):
-            print("Warning: Generated face does not match the input identity.")
-
         if not return_dict:
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(
             images=image, nsfw_content_detected=has_nsfw_concept
         )
-
 
 
 
